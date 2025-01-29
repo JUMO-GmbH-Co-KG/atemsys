@@ -477,7 +477,7 @@ static int ReturnMdioOrderIoctl(unsigned long ioctlParam);
 static int GetPhyInfoIoctl(unsigned long ioctlParam);
 static int PhyResetIoctl(unsigned long ioctlParam);
 static int ResetPhyViaGpio(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate);
-static int EthernetDriverRemove(struct platform_device* pPDev);
+static void EthernetDriverRemove(struct platform_device* pPDev);
 static int EthernetDriverProbe(struct platform_device* pPDev);
 
 #if (defined CONFIG_XENO_COBALT)
@@ -4441,7 +4441,7 @@ static int EthernetDriverProbe(struct platform_device* pPDev)
     if (dwIndex >= ATEMSYS_MAX_NUMBER_DRV_INSTANCES)
     {
         ERR("%s: Maximum number of instances exceeded!\n", pPDev->name);
-        return EthernetDriverRemove(pPDev);
+        EthernetDriverRemove(pPDev);
     }
 
 #ifdef INCLUDE_ATEMSYS_DT_REGISTER_NETDEVICE
@@ -4559,7 +4559,7 @@ int RegisterEthernetDriverAsNetDevice(struct device_node* pDevNode, struct _ATEM
 }
 #endif /* #ifdef INCLUDE_ATEMSYS_DT_REGISTER_NETDEVICE */
 
-static int EthernetDriverRemove(struct platform_device* pPDev)
+static void EthernetDriverRemove(struct platform_device* pPDev)
 {
     struct net_device* pNDev = platform_get_drvdata(pPDev);
     ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate = netdev_priv(pNDev);
@@ -4612,7 +4612,6 @@ static int EthernetDriverRemove(struct platform_device* pPDev)
         pDrvDescPrivate->pDevDesc               = NULL;
     }
 
-    return 0;
 }
 
 static int CleanUpEthernetDriverOnRelease(ATEMSYS_T_DEVICE_DESC* pDevDesc)
