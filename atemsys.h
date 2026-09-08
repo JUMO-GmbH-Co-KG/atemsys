@@ -161,6 +161,14 @@
  *            Add dma-coherent support: cached user space mapping of the DMA memory for
  *            devices with cache coherent DMA (e.g. device tree property "dma-coherent")
  *          - Add PHY management for PCI devices described in the device tree (atemsys_pci)
+ *  V1.4.40 - Add support gpio phy reset hold polarity
+ *            Add clock and reset support for PCI devices described in the device tree
+ *            Add MDIO C45 wrappers for Kernel >= 6.3.00
+ *            Fix build on kernels where struct bus_dma_region no longer has the 'offset' member
+ *             (compute dma_pfn_offset from cpu_start - dma_start)
+ *            Add debug log of the DMA user space mapping memory-type (vm_page_prot) on arm/aarch64/riscv
+ *            Fix CPSWG for Kernel >= 6.14.9 (skip_fdq argument dropped from k3_udma_glue_reset_rx_chn)
+ *            Fix typo in define ATEMSYS_DONT_SET_NONCACHED_DMA_PAGEPROTECTIONLFAG -> ...FLAG
  *  atemsys is shared across EC-Master V2.7+
 
  *----------------------------------------------------------------------------*/
@@ -175,10 +183,10 @@
 #define EC_ATEMSYSVERSION(a,b,c) (((a)<<2*8)+((b)<<1*8)+((c)<<0*8))
 #endif
 
-#define ATEMSYS_VERSION_STR "1.4.39"
-#define ATEMSYS_VERSION_NUM  1,4,39
+#define ATEMSYS_VERSION_STR "1.4.40"
+#define ATEMSYS_VERSION_NUM  1,4,40
 #if (defined ATEMSYS_C)
-#define USE_ATEMSYS_API_VERSION EC_ATEMSYSVERSION(1,4,39)
+#define USE_ATEMSYS_API_VERSION EC_ATEMSYSVERSION(1,4,40)
 #endif
 
 /* support selection */

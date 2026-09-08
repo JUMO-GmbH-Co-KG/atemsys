@@ -177,6 +177,7 @@
 #include <asm/param.h>
 #include <linux/of_gpio.h>
 #include <linux/reset.h>
+#include <dt-bindings/gpio/gpio.h>   /* GPIO_ACTIVE_LOW: device tree gpio-flags bit */
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0))
 #include <linux/of_platform.h>
@@ -506,6 +507,7 @@ typedef struct _ATEMSYS_T_DRV_DESC_PRIVATE
     bool                        bPhyResetGpioActiveHigh;
     int                         nPhyResetDuration;
     int                         nPhyResetPostDelay;
+    bool                        bPhyResetHold;
 
     /* mdio */
     ATEMSYS_T_MDIO_ORDER        MdioOrder;
@@ -2110,7 +2112,11 @@ static int CpswgCmd(void* arg,  ATEMSYS_T_CPSWG_CMD* pConfig)
         }
         k3_udma_glue_tdown_rx_chn(*ppRxChn, true);
         for (i = 0; i < AM65_CPSW_MAX_RX_FLOWS; i++)
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,14,9))
             k3_udma_glue_reset_rx_chn(*ppRxChn, i, NULL, cleanup, !!i);
+#else
+            k3_udma_glue_reset_rx_chn(*ppRxChn, i, NULL, cleanup);
+#endif
 
         k3_udma_glue_disable_rx_chn(*ppRxChn);
     } break;
@@ -2925,14 +2931,17 @@ static int device_mmap(struct file* filp, struct vm_area_struct* vma)
          if ((NULL != pDevDesc->pPcidev) && (NULL != pDevDesc->pPcidev->dev.dma_range_map))
          {
             const struct bus_dma_region* map = pDevDesc->pPcidev->dev.dma_range_map;
-            unsigned long dma_pfn_offset = ((map->offset) >> PAGE_SHIFT);
+            /* The 'offset' member was removed from struct bus_dma_region in recent kernels.
+             * It always equalled (cpu_start - dma_start); compute it directly instead.
+             * cpu_start/dma_start exist in all kernels that provide dma_range_map (>= 5.10). */
+            unsigned long dma_pfn_offset = (unsigned long)((map->cpu_start - map->dma_start) >> PAGE_SHIFT);
             dwDmaPfn = dwDmaPfn + dma_pfn_offset;
             INF("mmap: remap_pfn_range dma pfn 0x%x, offset pfn 0x%x\n",
                         dwDmaPfn, (u32)dma_pfn_offset);
          }
   #endif /* (LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0))*/
  #endif /* (defined CONFIG_PCI) */
-#if (!defined ATEMSYS_DONT_SET_NONCACHED_DMA_PAGEPROTECTIONLFAG)
+#if (!defined ATEMSYS_DONT_SET_NONCACHED_DMA_PAGEPROTECTIONFLAG)
          vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 #endif
 #elif (defined __PPC__)
@@ -2982,7 +2991,7 @@ static int device_mmap(struct file* filp, struct vm_area_struct* vma)
          }
 #endif
 
-#if ((defined __arm__) || (defined __aarch64__) || (defined __riscv)) && (!defined ATEMSYS_DONT_SET_NONCACHED_DMA_PAGEPROTECTIONLFAG)
+#if ((defined __arm__) || (defined __aarch64__) || (defined __riscv)) && (!defined ATEMSYS_DONT_SET_NONCACHED_DMA_PAGEPROTECTIONFLAG)
          if (!bDmaCoherent)
          {
             vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
@@ -3033,6 +3042,16 @@ static int device_mmap(struct file* filp, struct vm_area_struct* vma)
 
       INF("mmap: mapped DMA memory, Phys:0x%px KVirt:0x%px UVirt:0x%px Size:%u\n",
              (void*)(unsigned long)dmaAddr, (void*)pVa, (void*)vma->vm_start, dwLen);
+
+#if (defined __aarch64__) || (defined __arm__) || (defined __riscv)
+      /* Dump the mapping's MMU memory-type: compare vm_page_prot against the
+       * noncached / writecombine / cacheable reference attributes. */
+      DBG("mmap: vm_page_prot=0x%llx (noncached=0x%llx writecombine=0x%llx cacheable=0x%llx)\n",
+          (unsigned long long)pgprot_val(vma->vm_page_prot),
+          (unsigned long long)pgprot_val(pgprot_noncached(PAGE_KERNEL)),
+          (unsigned long long)pgprot_val(pgprot_writecombine(PAGE_KERNEL)),
+          (unsigned long long)pgprot_val(PAGE_KERNEL));
+#endif
    }
 
    nRet = 0;
@@ -3944,6 +3963,19 @@ static int MdioWrite(struct mii_bus* pBus, int mii_id, int regnum, u16 value)
     return nRetVal;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0))
+#define ATEMSYS_MII_ADDR_C45  (1 << 30)
+
+static int MdioReadC45(struct mii_bus* pBus, int mii_id, int devad, int regnum)
+{
+    return MdioRead(pBus, mii_id, ATEMSYS_MII_ADDR_C45 | (devad << 16) | (regnum & 0xFFFF));
+}
+static int MdioWriteC45(struct mii_bus* pBus, int mii_id, int devad, int regnum, u16 value)
+{
+    return MdioWrite(pBus, mii_id, ATEMSYS_MII_ADDR_C45 | (devad << 16) | (regnum & 0xFFFF), value);
+}
+#endif
+
 static int MdioInit(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate)
 {
     int nRes = -ENXIO;
@@ -3965,6 +3997,10 @@ static int MdioInit(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate)
     pDrvDescPrivate->pMdioBus->name = "atemsys_mdio_bus";
     pDrvDescPrivate->pMdioBus->read = &MdioRead;
     pDrvDescPrivate->pMdioBus->write = &MdioWrite;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0))
+    pDrvDescPrivate->pMdioBus->read_c45 = &MdioReadC45;
+    pDrvDescPrivate->pMdioBus->write_c45 = &MdioWriteC45;
+#endif
     snprintf(pDrvDescPrivate->pMdioBus->id, MII_BUS_ID_SIZE, "%s-%x", dev_name(pDrvDescPrivate->pDev), pDrvDescPrivate->nDev_id + 1);
     pDrvDescPrivate->pMdioBus->priv = pDrvDescPrivate;
     pDrvDescPrivate->pMdioBus->parent = pDrvDescPrivate->pDev;
@@ -4141,9 +4177,7 @@ static struct device_node* findDeviceTreeNode(struct platform_device* pPDev)
 static int ResetPhyViaGpio(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate)
 {
     int nRes = 0;
-#if (LINUX_VERSION_CODE > KERNEL_VERSION(6,0,0))
     if (!pDrvDescPrivate->bPhyResetGpioPinOwner)
-#endif
     {
         nRes = devm_gpio_request_one(pDrvDescPrivate->pDev, pDrvDescPrivate->nPhyResetGpioPin,
             pDrvDescPrivate->bPhyResetGpioActiveHigh ? GPIOF_OUT_INIT_HIGH : GPIOF_OUT_INIT_LOW,
@@ -4156,6 +4190,11 @@ static int ResetPhyViaGpio(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate)
         return nRes;
     }
 
+    if (pDrvDescPrivate->bPhyResetHold)
+    {
+        return 0;
+    }
+
     if (pDrvDescPrivate->nPhyResetDuration > 20)
         msleep(pDrvDescPrivate->nPhyResetDuration);
     else
@@ -4165,6 +4204,7 @@ static int ResetPhyViaGpio(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate)
 
 #if (LINUX_VERSION_CODE <= KERNEL_VERSION(6,0,0))
     devm_gpio_free(pDrvDescPrivate->pDev, pDrvDescPrivate->nPhyResetGpioPin);
+    pDrvDescPrivate->bPhyResetGpioPinOwner = false;
 #endif
 
     if (!pDrvDescPrivate->nPhyResetPostDelay)
@@ -4232,14 +4272,98 @@ static struct device_node* AtemsysResolveRef(struct device_node* pDevNode,
     return pNode;
 }
 
-/* Parse atemsys-relevant properties (ident, instance, phy-mode, phy-handle, mdio-bus ownership, PHY reset) from an OF node into pDrvDescPrivate->MacInfo */
-static void AtemsysGetMacInfoFromDtNode(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate,
-                                        struct device_node* pDevNode, const char* szName)
+/* Enable clocks and resets of the OF node and parse the atemsys-relevant properties into MacInfo */
+static void AtemsysDtNodeAcquire(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate,
+                                  struct device_node* pDevNode, const char* szName)
 {
+    struct device*  pDev            = pDrvDescPrivate->pDev;
     unsigned int    dwTemp          = 0;
     const char*     szTempString    = NULL;
     unsigned int    adwTempValues[6];
     int             nRes            = 0;
+    unsigned int    dwIndex         = 0;
+
+    /* enable clocks */
+    pDrvDescPrivate->nClkCnt = of_property_count_strings(pDevNode, "clock-names");
+    if (pDrvDescPrivate->nClkCnt > 0)
+    {
+        pDrvDescPrivate->apClkNames = kzalloc(sizeof(char*) * pDrvDescPrivate->nClkCnt, GFP_KERNEL);
+        pDrvDescPrivate->apClks = kzalloc(sizeof(struct clk*) * pDrvDescPrivate->nClkCnt, GFP_KERNEL);
+        if ((NULL == pDrvDescPrivate->apClkNames) || (NULL == pDrvDescPrivate->apClks))
+        {
+            pDrvDescPrivate->nClkCnt = 0;
+        }
+        else
+        {
+            for (dwIndex = 0; dwIndex < (unsigned int)pDrvDescPrivate->nClkCnt; dwIndex++)
+            {
+                if (!of_property_read_string_index(pDevNode, "clock-names", dwIndex, &pDrvDescPrivate->apClkNames[dwIndex]))
+                {
+                    pDrvDescPrivate->apClks[dwIndex] = devm_clk_get(pDev, pDrvDescPrivate->apClkNames[dwIndex]);
+                    if (!IS_ERR(pDrvDescPrivate->apClks[dwIndex]))
+                    {
+                        clk_prepare_enable(pDrvDescPrivate->apClks[dwIndex]);
+                        DBG("%s: Clock %s enabled\n", szName, pDrvDescPrivate->apClkNames[dwIndex]);
+                    }
+                    else
+                    {
+                        pDrvDescPrivate->apClks[dwIndex] = NULL;
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        pDrvDescPrivate->nClkCnt = 0;
+    }
+    DBG("%s: found %d Clocks\n", szName, pDrvDescPrivate->nClkCnt);
+
+    /* resets */
+    pDrvDescPrivate->nResetCtlCnt = of_property_count_strings(pDevNode, "reset-names");
+    if (pDrvDescPrivate->nResetCtlCnt > 0)
+    {
+        pDrvDescPrivate->apResetNames = kzalloc(sizeof(char*) * pDrvDescPrivate->nResetCtlCnt, GFP_KERNEL);
+        pDrvDescPrivate->apResetCtls = kzalloc(sizeof(struct reset_control*) * pDrvDescPrivate->nResetCtlCnt, GFP_KERNEL);
+        if ((NULL == pDrvDescPrivate->apResetNames) || (NULL == pDrvDescPrivate->apResetCtls))
+        {
+            pDrvDescPrivate->nResetCtlCnt = 0;
+        }
+        else
+        {
+            for (dwIndex = 0; dwIndex < (unsigned int)pDrvDescPrivate->nResetCtlCnt; dwIndex++)
+            {
+                if (!of_property_read_string_index(pDevNode, "reset-names", dwIndex, &pDrvDescPrivate->apResetNames[dwIndex]))
+                {
+                    struct reset_control* pResetCtl = devm_reset_control_get_optional(pDev, pDrvDescPrivate->apResetNames[dwIndex]);
+                    if (IS_ERR(pResetCtl))
+                    {
+                        pResetCtl = NULL;
+                    }
+                    if (NULL != pResetCtl)
+                    {
+                        nRes = reset_control_assert(pResetCtl);
+                        reset_control_deassert(pResetCtl);
+
+                        /* Some reset controllers have only reset callback instead of
+                        * assert + deassert callbacks pair.
+                        */
+                        if (-ENOTSUPP == nRes)
+                        {
+                            reset_control_reset(pResetCtl);
+                        }
+                        DBG("%s: Reset %s\n", szName, pDrvDescPrivate->apResetNames[dwIndex]);
+                    }
+                    pDrvDescPrivate->apResetCtls[dwIndex] = pResetCtl;
+                }
+            }
+        }
+    }
+    else
+    {
+        pDrvDescPrivate->nResetCtlCnt = 0;
+    }
+    DBG("%s: found %d Resets\n", szName, pDrvDescPrivate->nResetCtlCnt);
 
     /* get identification */
     nRes = of_property_read_string(pDevNode, "atemsys-Ident", &szTempString);
@@ -4466,14 +4590,29 @@ static void AtemsysGetMacInfoFromDtNode(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPriv
     /* PHY reset data */
     if (of_find_property(pDevNode, "atemsys-phy-reset-gpios", NULL))
     {
-        struct device_node* pNode;
-        const char* pProp;
-        u32 nTmp;
+        struct device_node* pNode = NULL;
+        const char* pProp = NULL;
+        u32 nTmp = 0;
+        struct of_phandle_args oGpioSpec;
 
         pNode = AtemsysResolveRef(pDevNode, "atemsys-phy-reset-gpios", &pProp);
         pDrvDescPrivate->nPhyResetGpioPin = of_get_named_gpio(
             pNode ? pNode : pDevNode,
             pNode ? pProp : "atemsys-phy-reset-gpios", 0);
+
+        pDrvDescPrivate->bPhyResetGpioActiveHigh = true;
+        if (0 == of_parse_phandle_with_args(
+                pNode ? pNode : pDevNode,
+                pNode ? pProp : "atemsys-phy-reset-gpios",
+                "#gpio-cells", 0, &oGpioSpec))
+        {
+            if (oGpioSpec.args_count > 0)
+            {
+                pDrvDescPrivate->bPhyResetGpioActiveHigh =
+                    (0 == (oGpioSpec.args[oGpioSpec.args_count - 1] & GPIO_ACTIVE_LOW));
+            }
+            of_node_put(oGpioSpec.np);
+        }
         if (NULL != pNode) { of_node_put(pNode); }
 
         pNode = AtemsysResolveRef(pDevNode, "atemsys-phy-reset-duration", &pProp);
@@ -4495,17 +4634,34 @@ static void AtemsysGetMacInfoFromDtNode(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPriv
         pDrvDescPrivate->nPhyResetPostDelay = (int)nTmp;
 
         pNode = AtemsysResolveRef(pDevNode, "atemsys-phy-reset-active-high", &pProp);
-        pDrvDescPrivate->bPhyResetGpioActiveHigh = of_property_read_bool(
-            pNode ? pNode : pDevNode,
-            pNode ? pProp : "atemsys-phy-reset-active-high");
+        if (of_property_read_bool(pNode ? pNode : pDevNode,
+                                  pNode ? pProp : "atemsys-phy-reset-active-high"))
+        {
+            pDrvDescPrivate->bPhyResetGpioActiveHigh = true;
+        }
+        if (NULL != pNode) { of_node_put(pNode); }
+
+        pNode = AtemsysResolveRef(pDevNode, "atemsys-phy-reset-active-low", &pProp);
+        if (of_property_read_bool(pNode ? pNode : pDevNode,
+                                  pNode ? pProp : "atemsys-phy-reset-active-low"))
+        {
+            pDrvDescPrivate->bPhyResetGpioActiveHigh = false;
+        }
         if (NULL != pNode) { of_node_put(pNode); }
 
         if ((0 <= pDrvDescPrivate->nPhyResetGpioPin) && gpio_is_valid(pDrvDescPrivate->nPhyResetGpioPin))
         {
+            pNode = AtemsysResolveRef(pDevNode, "atemsys-phy-reset-hold", &pProp);
+            pDrvDescPrivate->bPhyResetHold = of_property_read_bool(
+                pNode ? pNode : pDevNode,
+                pNode ? pProp : "atemsys-phy-reset-hold");
+            if (NULL != pNode) { of_node_put(pNode); }
+
             pDrvDescPrivate->MacInfo.bPhyResetSupported = true;
-            DBG("%s: PhyReset ready: GpioPin: %d; Duration %d, bActiveHigh %d, post delay %d\n", szName,
+            DBG("%s: PhyReset ready: GpioPin: %d; Duration %d, bActiveHigh %d, post delay %d, hold %d\n", szName,
                 pDrvDescPrivate->nPhyResetGpioPin, pDrvDescPrivate->nPhyResetDuration,
-                pDrvDescPrivate->bPhyResetGpioActiveHigh, pDrvDescPrivate->nPhyResetPostDelay);
+                pDrvDescPrivate->bPhyResetGpioActiveHigh, pDrvDescPrivate->nPhyResetPostDelay,
+                pDrvDescPrivate->bPhyResetHold);
         }
     }
 
@@ -4527,6 +4683,36 @@ static void AtemsysGetMacInfoFromDtNode(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPriv
     }
 }
 
+static void AtemsysDtNodeRelease(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate)
+{
+    unsigned int dwIndex = 0;
+
+    of_node_put(pDrvDescPrivate->pMdioDevNode);
+    of_node_put(pDrvDescPrivate->pPhyNode);
+
+    for (dwIndex = 0; dwIndex < (unsigned int)pDrvDescPrivate->nResetCtlCnt; dwIndex++)
+    {
+        if (NULL != pDrvDescPrivate->apResetCtls[dwIndex])
+        {
+            reset_control_assert(pDrvDescPrivate->apResetCtls[dwIndex]);
+            DBG("Reset %s assert\n", pDrvDescPrivate->apResetNames[dwIndex]);
+        }
+    }
+    kfree(pDrvDescPrivate->apResetCtls);
+    kfree(pDrvDescPrivate->apResetNames);
+
+    for (dwIndex = 0; dwIndex < (unsigned int)pDrvDescPrivate->nClkCnt; dwIndex++)
+    {
+        if (NULL != pDrvDescPrivate->apClks[dwIndex])
+        {
+            clk_disable_unprepare(pDrvDescPrivate->apClks[dwIndex]);
+            DBG("Clock %s unprepared\n", pDrvDescPrivate->apClkNames[dwIndex]);
+        }
+    }
+    kfree(pDrvDescPrivate->apClks);
+    kfree(pDrvDescPrivate->apClkNames);
+}
+
 static int EthernetDriverProbe(struct platform_device* pPDev)
 {
     ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate = NULL;
@@ -4534,7 +4720,6 @@ static int EthernetDriverProbe(struct platform_device* pPDev)
     const struct of_device_id* pOf_id = NULL;
     static int nDev_id = 0;
     unsigned int dwIndex = 0;
-    int nRes = 0;
     struct device_node* pDevNode = NULL;
 
     INF("Atemsys: Probe device: %s\n", pPDev->name);
@@ -4584,44 +4769,6 @@ static int EthernetDriverProbe(struct platform_device* pPDev)
     /* Select default pin state */
     pinctrl_pm_select_default_state(&pPDev->dev);
 
-    /* enable clock */
-    pDrvDescPrivate->nClkCnt = of_property_count_strings(pDevNode,"clock-names");
-    if (pDrvDescPrivate->nClkCnt > 0)
-    {
-        pDrvDescPrivate->apClkNames = kzalloc(sizeof(char*) * pDrvDescPrivate->nClkCnt, GFP_KERNEL);
-        if (NULL == pDrvDescPrivate->apClkNames)
-        {
-            return -ENOMEM;
-        }
-        pDrvDescPrivate->apClks = kzalloc(sizeof(struct clk*) * pDrvDescPrivate->nClkCnt, GFP_KERNEL);
-        if (NULL == pDrvDescPrivate->apClks)
-        {
-            return -ENOMEM;
-        }
-
-        for (dwIndex = 0; dwIndex < pDrvDescPrivate->nClkCnt; dwIndex++)
-        {
-            if(!of_property_read_string_index(pDevNode, "clock-names", dwIndex, &pDrvDescPrivate->apClkNames[dwIndex]))
-            {
-                pDrvDescPrivate->apClks[dwIndex] = devm_clk_get(&pPDev->dev, pDrvDescPrivate->apClkNames[dwIndex]);
-                if (!IS_ERR(pDrvDescPrivate->apClks[dwIndex]))
-                {
-                    clk_prepare_enable(pDrvDescPrivate->apClks[dwIndex]);
-                    DBG("%s: Clock %s enabled\n", pPDev->name, pDrvDescPrivate->apClkNames[dwIndex]);
-                }
-                else
-                {
-                    pDrvDescPrivate->apClks[dwIndex] = NULL;
-                }
-            }
-        }
-    }
-    else
-    {
-        pDrvDescPrivate->nClkCnt = 0;
-    }
-    DBG("%s: found %d Clocks\n", pPDev->name , pDrvDescPrivate->nClkCnt);
-
     /* enable PHY regulator*/
     pDrvDescPrivate->pPhyRegulator = devm_regulator_get(&pPDev->dev, "phy");
     if (!IS_ERR(pDrvDescPrivate->pPhyRegulator))
@@ -4642,52 +4789,7 @@ static int EthernetDriverProbe(struct platform_device* pPDev)
     pm_runtime_set_active(&pPDev->dev);
     pm_runtime_enable(&pPDev->dev);
 
-    /* resets */
-    pDrvDescPrivate->nResetCtlCnt = of_property_count_strings(pDevNode,"reset-names");
-    if (pDrvDescPrivate->nResetCtlCnt > 0)
-    {
-        pDrvDescPrivate->apResetNames = kzalloc(sizeof(char*) * pDrvDescPrivate->nResetCtlCnt, GFP_KERNEL);
-        if (NULL == pDrvDescPrivate->apResetNames)
-        {
-            return -ENOMEM;
-        }
-        pDrvDescPrivate->apResetCtls = kzalloc(sizeof(struct reset_control*) * pDrvDescPrivate->nResetCtlCnt, GFP_KERNEL);
-        if (NULL == pDrvDescPrivate->apResetCtls)
-        {
-            return -ENOMEM;
-        }
-
-        for (dwIndex = 0; dwIndex < pDrvDescPrivate->nResetCtlCnt; dwIndex++)
-        {
-            if(!of_property_read_string_index(pDevNode, "reset-names", dwIndex, &pDrvDescPrivate->apResetNames[dwIndex]))
-            {
-                struct reset_control* pResetCtl = devm_reset_control_get_optional(&pPDev->dev, pDrvDescPrivate->apResetNames[dwIndex]);
-                if (NULL != pResetCtl)
-                {
-                    nRes = reset_control_assert(pResetCtl);
-                    reset_control_deassert(pResetCtl);
-
-                    /* Some reset controllers have only reset callback instead of
-                    * assert + deassert callbacks pair.
-                    */
-                    if (-ENOTSUPP == nRes)
-                    {
-                        reset_control_reset(pResetCtl);
-                    }
-                    DBG("%s: Reset %s\n", pPDev->name, pDrvDescPrivate->apResetNames[dwIndex]);
-                }
-                pDrvDescPrivate->apResetCtls[dwIndex] = pResetCtl;
-            }
-        }
-    }
-    else
-    {
-        pDrvDescPrivate->nResetCtlCnt = 0;
-    }
-    DBG("%s: found %d Resets\n", pPDev->name , pDrvDescPrivate->nResetCtlCnt);
-
-    /* get prepare data for atemsys and print some data to kernel log */
-    AtemsysGetMacInfoFromDtNode(pDrvDescPrivate, pDevNode, pPDev->name);
+    AtemsysDtNodeAcquire(pDrvDescPrivate, pDevNode, pPDev->name);
 
     /* insert device to array */
     for (dwIndex = 0; dwIndex < ATEMSYS_MAX_NUMBER_DRV_INSTANCES; dwIndex++)
@@ -4834,7 +4936,6 @@ static int EthernetDriverRemove(struct platform_device* pPDev)
 {
     struct net_device* pNDev = platform_get_drvdata(pPDev);
     ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate = netdev_priv(pNDev);
-    unsigned int i = 0;
 
     if ((NULL != pDrvDescPrivate->pPhyDev) || (NULL != pDrvDescPrivate->pMdioBus))
     {
@@ -4846,38 +4947,10 @@ static int EthernetDriverRemove(struct platform_device* pPDev)
         regulator_disable(pDrvDescPrivate->pPhyRegulator);
     }
 
-    if (NULL != pDrvDescPrivate->pMdioDevNode)
-    {
-        of_node_put(pDrvDescPrivate->pMdioDevNode);
-    }
-    /* Decrement refcount */
-    of_node_put(pDrvDescPrivate->pPhyNode);
-    
     pm_runtime_put(&pPDev->dev);
     pm_runtime_disable(&pPDev->dev);
 
-    /* resets */
-    for (i = 0; i < pDrvDescPrivate->nResetCtlCnt; i++)
-    {
-        if (NULL != pDrvDescPrivate->apResetCtls[i])
-        {
-            reset_control_assert(pDrvDescPrivate->apResetCtls[i]);
-            DBG("%s: Reset %s assert\n", pPDev->name, pDrvDescPrivate->apResetNames[i]);
-        }
-    }
-    kfree(pDrvDescPrivate->apResetCtls);
-    kfree(pDrvDescPrivate->apResetNames);
-    
-    for (i = 0; i < pDrvDescPrivate->nClkCnt; i++)
-    {
-        if (NULL != pDrvDescPrivate->apClks[i])
-        {
-            clk_disable_unprepare(pDrvDescPrivate->apClks[i]);
-            DBG("%s: Clock %s unprepared\n", pPDev->name, pDrvDescPrivate->apClkNames[i]);
-        }
-    }
-    kfree(pDrvDescPrivate->apClks);
-    kfree(pDrvDescPrivate->apClkNames);
+    AtemsysDtNodeRelease(pDrvDescPrivate);
 
     mutex_destroy(&pDrvDescPrivate->mdio_mutex);
     mutex_destroy(&pDrvDescPrivate->mdio_order_mutex);
@@ -5014,7 +5087,8 @@ static int PciDriverProbePhy(struct pci_dev* pPciDev, ATEMSYS_T_PCI_DRV_DESC_PRI
     pDrvDescPrivate->pDevNode = pDevNode;
     pDrvDescPrivate->nDev_id  = 0; /* only relevant for an atemsys-owned mdio bus, unused here */
 
-    AtemsysGetMacInfoFromDtNode(pDrvDescPrivate, pDevNode, pci_name(pPciDev));
+    /* the native driver releases clocks/resets on unbind, so this path must hold them itself */
+    AtemsysDtNodeAcquire(pDrvDescPrivate, pDevNode, pci_name(pPciDev));
 
     /* insert device to array (matched by Ident+Instance in GetMacInfoIoctl) */
     for (dwIndex = 0; dwIndex < ATEMSYS_MAX_NUMBER_DRV_INSTANCES; dwIndex++)
@@ -5029,8 +5103,7 @@ static int PciDriverProbePhy(struct pci_dev* pPciDev, ATEMSYS_T_PCI_DRV_DESC_PRI
     if (dwIndex >= ATEMSYS_MAX_NUMBER_DRV_INSTANCES)
     {
         ERR("%s: PciDriverProbePhy: Maximum number of instances exceeded!\n", pci_name(pPciDev));
-        if (NULL != pDrvDescPrivate->pMdioDevNode) { of_node_put(pDrvDescPrivate->pMdioDevNode); }
-        of_node_put(pDrvDescPrivate->pPhyNode);
+        AtemsysDtNodeRelease(pDrvDescPrivate);
         free_netdev(pNDev);
         return -EBUSY;
     }
@@ -5064,11 +5137,7 @@ static void PciDriverRemovePhy(ATEMSYS_T_PCI_DRV_DESC_PRIVATE* pPciDrvDescPrivat
     /* stop PHY and release mdio bus if still active (safe when never started) */
     StopPhy(pDrvDescPrivate);
 
-    if (NULL != pDrvDescPrivate->pMdioDevNode)
-    {
-        of_node_put(pDrvDescPrivate->pMdioDevNode);
-    }
-    of_node_put(pDrvDescPrivate->pPhyNode);
+    AtemsysDtNodeRelease(pDrvDescPrivate);
 
     mutex_destroy(&pDrvDescPrivate->mdio_mutex);
     mutex_destroy(&pDrvDescPrivate->mdio_order_mutex);
