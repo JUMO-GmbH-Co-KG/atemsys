@@ -321,7 +321,7 @@ MODULE_PARM_DESC(bRegisterDtbNetDevice, "Register netdevice on device tree nodes
  * In this case the DMA address returned by dma_alloc_coherent() is an IO virtual
  * address and the user space mapping must be done by dma_mmap_coherent().
  */
-static bool DeviceIsIommuMapped(struct device* pDev)
+static bool __maybe_unused DeviceIsIommuMapped(struct device* pDev)
 {
 #if (defined INCLUDE_ATEMSYS_IOMMU_SUPPORT)
     struct iommu_domain* pIommuDomain = NULL;
@@ -348,7 +348,7 @@ static bool DeviceIsIommuMapped(struct device* pDev)
  * device snoops the CPU caches.
  */
 #if ((defined CONFIG_PCI) || (LINUX_VERSION_CODE > KERNEL_VERSION(5,4,0)))
-static bool DeviceIsDmaCoherent(struct device* pDev)
+static bool __maybe_unused DeviceIsDmaCoherent(struct device* pDev)
 {
     if (NULL == pDev)
     {
@@ -358,7 +358,8 @@ static bool DeviceIsDmaCoherent(struct device* pDev)
  #if ((LINUX_VERSION_CODE > KERNEL_VERSION(5,0,0)) \
        && ((defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_DEVICE) || defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU) || defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU_ALL))))
     return (0 != pDev->dma_coherent);
- #elif ((LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)) && (defined CONFIG_PHYS_ADDR_T_64BIT))
+ #elif ((LINUX_VERSION_CODE >= KERNEL_VERSION(3,18,0)) && (LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)) \
+       && (defined CONFIG_PHYS_ADDR_T_64BIT))
     return is_device_dma_coherent(pDev);
  #else
     return false;
@@ -470,6 +471,9 @@ typedef struct
     __u32           dwSize;
 } ATEMSYS_T_IOMEM;
 
+/* room reserved in the clock list for the clocks of the PHY sub-node */
+#define ATEMSYS_MAX_PHY_CLKS 16
+
 typedef struct _ATEMSYS_T_DRV_DESC_PRIVATE
 {
     int                         nDev_id;
@@ -486,9 +490,12 @@ typedef struct _ATEMSYS_T_DRV_DESC_PRIVATE
     struct reset_control**      apResetCtls;
     int                         nResetCtlCnt;
     /* clocks */
-    const char**                apClkNames;
+    const char**                apClkNames;         /* "clock-names" of the MAC node, generated names for the clocks of the PHY sub-node */
     struct clk**                apClks;
-    int                         nClkCnt;
+    bool*                       abClkPutRequired;   /* of_clk_get() needs clk_put(), devm_clk_get() does not */
+    char*                       pszPhyClkNames;     /* storage for the generated names, the device tree holds none */
+    int                         nClkCnt;            /* used entries */
+    int                         nClkMax;            /* allocated entries */
 
     /* PHY */
     ATEMSYS_T_PHY_INFO          PhyInfo;
@@ -545,6 +552,7 @@ static int GetMdioOrderIoctl(unsigned long ioctlParam);
 static int ReturnMdioOrderIoctl(unsigned long ioctlParam);
 static int GetPhyInfoIoctl(unsigned long ioctlParam);
 static int PhyResetIoctl(unsigned long ioctlParam);
+static int ClockCmdIoctl(unsigned long ioctlParam);
 static int ResetPhyViaGpio(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate);
 #if (LINUX_VERSION_CODE > KERNEL_VERSION(6,11,0))
 static void EthernetDriverRemove(struct platform_device* pPDev);
@@ -726,7 +734,9 @@ static void dev_munmap(struct vm_area_struct* vma)
 #endif
    {
 #if (defined __arm__) || (defined __aarch64__) || (defined __riscv)
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6,12,0) /* not tested */)
       dmam_free_coherent(&pMmapDesc->pDevDesc->pPlatformDev->dev, pMmapDesc->len, pMmapDesc->pVirtAddr, pMmapDesc->dmaAddr);
+ #endif
 #else
       dev_dma_free(pMmapDesc->len, pMmapDesc->pVirtAddr);
 #endif
@@ -894,7 +904,7 @@ static int DefaultPciSettings(struct pci_dev* pPciDev)
     else
     {
     /* remove wrong dma_coherent bit on ARM systems */
- #if (LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0))
+ #if ((LINUX_VERSION_CODE >= KERNEL_VERSION(3,18,0)) && (LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)))
   #if (defined CONFIG_PHYS_ADDR_T_64BIT)
     if (is_device_dma_coherent(&pPciDev->dev))
     {
@@ -2920,7 +2930,9 @@ static int device_mmap(struct file* filp, struct vm_area_struct* vma)
 #if (defined __arm__) || (defined __aarch64__) || (defined __riscv)
          dwDmaPfn = (dmaAddr >> PAGE_SHIFT);
  #if (defined CONFIG_PCI)
-  #if (LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0))
+  #if (LINUX_VERSION_CODE < KERNEL_VERSION(3,16,0))
+         /* no struct device::dma_pfn_offset before 3.16 */
+  #elif (LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0))
          if ((NULL != pDevDesc->pPcidev) && (0 != pDevDesc->pPcidev->dev.dma_pfn_offset))
          {
             dwDmaPfn = dwDmaPfn + pDevDesc->pPcidev->dev.dma_pfn_offset;
@@ -3316,6 +3328,15 @@ static long atemsys_ioctl(
         if (0 != nRetVal)
         {
             ERR("ioctl ATEMSYS_IOCTL_PHY_RESET failed: %d\n", nRetVal);
+            goto Exit;
+        }
+    } break;
+    case ATEMSYS_IOCTL_CLOCK_CMD:
+    {
+        nRetVal = ClockCmdIoctl(arg);
+        if (0 != nRetVal)
+        {
+            ERR("ioctl ATEMSYS_IOCTL_CLOCK_CMD failed: %d\n", nRetVal);
             goto Exit;
         }
     } break;
@@ -3721,6 +3742,154 @@ Exit:
     if (0 != nRetVal)
     {
         ERR("GetPhyInfoIoctl failed: %d\n", nRetVal);
+    }
+    return nRetVal;
+}
+
+/* Get or set the rate of one clock of the device tree node, selected by its
+ * entry in "clock-names". Replaces SoC-specific register accesses in user space,
+ * e.g. the RGMII speed clock of the Rockchip GMAC. */
+static int ClockCmdIoctl(unsigned long ioctlParam)
+{
+    ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate  = NULL;
+    ATEMSYS_T_CLOCK_CMD oCmd;
+    struct clk* pClk = NULL;
+    unsigned long ulRate = 0;
+    int nClkIdx = -1;
+    int nIndex = 0;
+    unsigned int dwRetVal = 0x98110000; /* EC_E_ERROR */
+    int nRetVal = -1;
+
+    memset(&oCmd, 0, sizeof(ATEMSYS_T_CLOCK_CMD));
+    nRetVal = copy_from_user(&oCmd, (ATEMSYS_T_CLOCK_CMD *)ioctlParam, sizeof(ATEMSYS_T_CLOCK_CMD));
+    if (0 != nRetVal)
+    {
+        ERR("ClockCmdIoctl failed: %d\n", nRetVal);
+        goto Exit;
+    }
+    /* the name comes from user space, don't rely on it being terminated */
+    oCmd.szClkName[ATEMSYS_CLOCK_NAME_MAX_LEN - 1] = '\0';
+
+    if (oCmd.dwIndex >= ATEMSYS_MAX_NUMBER_DRV_INSTANCES)
+    {
+        dwRetVal = 0x98110002; /* EC_E_INVALIDINDEX */
+        nRetVal = 0;
+        goto Exit;
+    }
+    pDrvDescPrivate = S_apDrvDescPrivate[oCmd.dwIndex];
+    if (NULL == pDrvDescPrivate)
+    {
+        dwRetVal = 0x9811000C; /* EC_E_NOTFOUND */
+        nRetVal = 0;
+        goto Exit;
+    }
+    oCmd.dwClkCnt = (__u32)pDrvDescPrivate->nClkCnt;
+
+    if ('\0' == oCmd.szClkName[0])
+    {
+        /* no name given, the clock is addressed by its index. Walking
+         * 0 .. dwClkCnt-1 this way lists the clocks with their names */
+        if ((int)oCmd.dwClkIndex >= pDrvDescPrivate->nClkCnt)
+        {
+            dwRetVal = 0x98110002; /* EC_E_INVALIDINDEX */
+            nRetVal = 0;
+            goto Exit;
+        }
+        nClkIdx = (int)oCmd.dwClkIndex;
+    }
+    else
+    {
+        for (nIndex = 0; nIndex < pDrvDescPrivate->nClkCnt; nIndex++)
+        {
+            if (   (NULL != pDrvDescPrivate->apClkNames[nIndex])
+                && (NULL != pDrvDescPrivate->apClks[nIndex])
+                && (0 == strcmp(pDrvDescPrivate->apClkNames[nIndex], oCmd.szClkName)))
+            {
+                nClkIdx = nIndex;
+                break;
+            }
+        }
+        if (0 > nClkIdx)
+        {
+            INF("%s: ClockCmdIoctl: clock %s not found\n", dev_name(pDrvDescPrivate->pDev), oCmd.szClkName);
+            dwRetVal = 0x9811000C; /* EC_E_NOTFOUND */
+            nRetVal = 0;
+            goto Exit;
+        }
+    }
+    pClk = pDrvDescPrivate->apClks[nClkIdx];
+    oCmd.dwClkIndex = (__u32)nClkIdx;
+    if (NULL != pDrvDescPrivate->apClkNames[nClkIdx])
+    {
+        snprintf(oCmd.szClkName, ATEMSYS_CLOCK_NAME_MAX_LEN, "%s", pDrvDescPrivate->apClkNames[nClkIdx]);
+    }
+
+    switch (oCmd.dwCmd)
+    {
+    case ATEMSYS_CLOCK_CMD_GET_RATE:
+    {
+        /* a clock named by the device tree but not provided by the system is listed with rate 0 */
+        if (NULL == pClk)
+        {
+            oCmd.qwRate = 0;
+        }
+        else
+        {
+            oCmd.qwRate = (__u64)clk_get_rate(pClk);
+        }
+    } break;
+
+    case ATEMSYS_CLOCK_CMD_SET_RATE:
+    {
+        if (NULL == pClk)
+        {
+            dwRetVal = 0x9811000C; /* EC_E_NOTFOUND */
+            nRetVal = 0;
+            goto Exit;
+        }
+        ulRate = (unsigned long)oCmd.qwRate;
+        /* on 32-bit, a rate beyond unsigned long cannot be represented */
+        if ((__u64)ulRate != oCmd.qwRate)
+        {
+            dwRetVal = 0x98110003; /* EC_E_INVALIDPARM */
+            nRetVal = 0;
+            goto Exit;
+        }
+        if (0 == ulRate)
+        {
+            dwRetVal = 0x98110003; /* EC_E_INVALIDPARM */
+            nRetVal = 0;
+            goto Exit;
+        }
+        nRetVal = clk_set_rate(pClk, ulRate);
+        if (0 != nRetVal)
+        {
+            ERR("%s: ClockCmdIoctl: failed to set clock %s to %lu Hz: %d\n",
+                dev_name(pDrvDescPrivate->pDev), oCmd.szClkName, ulRate, nRetVal);
+            nRetVal = 0;
+            goto Exit;
+        }
+        oCmd.qwRate = (__u64)clk_get_rate(pClk);
+        DBG("%s: ClockCmdIoctl: clock %s: %llu Hz\n",
+            dev_name(pDrvDescPrivate->pDev), oCmd.szClkName, oCmd.qwRate);
+    } break;
+
+    default:
+    {
+        dwRetVal = 0x98110001; /* EC_E_NOTSUPPORTED */
+        nRetVal = 0;
+        goto Exit;
+    } /* no break */
+    }
+
+    dwRetVal = 0; /* EC_E_NOERROR */
+    nRetVal = 0;
+Exit:
+    oCmd.dwErrorCode = dwRetVal;
+    nRetVal = copy_to_user((ATEMSYS_T_CLOCK_CMD *)ioctlParam, &oCmd, sizeof(ATEMSYS_T_CLOCK_CMD));
+    if (0 != nRetVal)
+    {
+        ERR("ClockCmdIoctl failed: %d\n", nRetVal);
     }
     return nRetVal;
 }
@@ -4272,6 +4441,58 @@ static struct device_node* AtemsysResolveRef(struct device_node* pDevNode,
     return pNode;
 }
 
+/* Clocks of the PHY sub-node are added to the clock list and enabled, just like
+ * the clocks of the MAC node. Their rate comes from "assigned-clock-rates" of the
+ * MAC node, applied by of_clk_set_defaults() before the driver is probed.
+ * A PHY node has no "clock-names", so its clocks are named "phy:<index>". */
+static void AtemsysEnableNodeClocks(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate,
+                                    struct device_node* pPhyNode, const char* szName)
+{
+    int nNodeClkCnt = 0;
+    int nNodeClkIdx = 0;
+    int nPhyClkIdx  = 0;    /* slot in the name buffer, counts the clocks taken over */
+
+    if (NULL == pPhyNode)
+    {
+        return;
+    }
+    nNodeClkCnt = of_count_phandle_with_args(pPhyNode, "clocks", "#clock-cells");
+
+    for (nNodeClkIdx = 0; nNodeClkIdx < nNodeClkCnt; nNodeClkIdx++)
+    {
+        struct clk* pClk       = NULL;
+        char*       pszClkName = NULL;
+
+        if (pDrvDescPrivate->nClkCnt >= pDrvDescPrivate->nClkMax)
+        {
+            WRN("%s: too many clocks, %s clock %d ignored\n", szName, of_node_full_name(pPhyNode), nNodeClkIdx);
+            break;
+        }
+        /* the device tree has no "clock-names" for a PHY node, build a name to address the clock with */
+        pszClkName = &pDrvDescPrivate->pszPhyClkNames[nPhyClkIdx * ATEMSYS_CLOCK_NAME_MAX_LEN];
+        snprintf(pszClkName, ATEMSYS_CLOCK_NAME_MAX_LEN, "phy:%d", nNodeClkIdx);
+
+        pClk = of_clk_get(pPhyNode, nNodeClkIdx);
+        if (IS_ERR(pClk))
+        {
+            ERR("%s: failed to get %s clock %d\n", szName, of_node_full_name(pPhyNode), nNodeClkIdx);
+            continue;
+        }
+        if (0 != clk_prepare_enable(pClk))
+        {
+            ERR("%s: failed to enable %s clock %d\n", szName, of_node_full_name(pPhyNode), nNodeClkIdx);
+            clk_put(pClk);
+            continue;
+        }
+        pDrvDescPrivate->apClkNames[pDrvDescPrivate->nClkCnt] = pszClkName;
+        pDrvDescPrivate->apClks[pDrvDescPrivate->nClkCnt] = pClk;
+        pDrvDescPrivate->abClkPutRequired[pDrvDescPrivate->nClkCnt] = true;
+        pDrvDescPrivate->nClkCnt++;
+        nPhyClkIdx++;
+        DBG("%s: Clock %s enabled: %lu Hz\n", szName, pszClkName, clk_get_rate(pClk));
+    }
+}
+
 /* Enable clocks and resets of the OF node and parse the atemsys-relevant properties into MacInfo */
 static void AtemsysDtNodeAcquire(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate,
                                   struct device_node* pDevNode, const char* szName)
@@ -4283,39 +4504,43 @@ static void AtemsysDtNodeAcquire(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate,
     int             nRes            = 0;
     unsigned int    dwIndex         = 0;
 
-    /* enable clocks */
+    /* enable clocks, the clocks of the PHY sub-node are appended to these lists later on */
     pDrvDescPrivate->nClkCnt = of_property_count_strings(pDevNode, "clock-names");
-    if (pDrvDescPrivate->nClkCnt > 0)
+    if (0 > pDrvDescPrivate->nClkCnt)
     {
-        pDrvDescPrivate->apClkNames = kzalloc(sizeof(char*) * pDrvDescPrivate->nClkCnt, GFP_KERNEL);
-        pDrvDescPrivate->apClks = kzalloc(sizeof(struct clk*) * pDrvDescPrivate->nClkCnt, GFP_KERNEL);
-        if ((NULL == pDrvDescPrivate->apClkNames) || (NULL == pDrvDescPrivate->apClks))
-        {
-            pDrvDescPrivate->nClkCnt = 0;
-        }
-        else
-        {
-            for (dwIndex = 0; dwIndex < (unsigned int)pDrvDescPrivate->nClkCnt; dwIndex++)
-            {
-                if (!of_property_read_string_index(pDevNode, "clock-names", dwIndex, &pDrvDescPrivate->apClkNames[dwIndex]))
-                {
-                    pDrvDescPrivate->apClks[dwIndex] = devm_clk_get(pDev, pDrvDescPrivate->apClkNames[dwIndex]);
-                    if (!IS_ERR(pDrvDescPrivate->apClks[dwIndex]))
-                    {
-                        clk_prepare_enable(pDrvDescPrivate->apClks[dwIndex]);
-                        DBG("%s: Clock %s enabled\n", szName, pDrvDescPrivate->apClkNames[dwIndex]);
-                    }
-                    else
-                    {
-                        pDrvDescPrivate->apClks[dwIndex] = NULL;
-                    }
-                }
-            }
-        }
+        pDrvDescPrivate->nClkCnt = 0;
+    }
+    pDrvDescPrivate->nClkMax = pDrvDescPrivate->nClkCnt + ATEMSYS_MAX_PHY_CLKS;
+    pDrvDescPrivate->apClkNames = kzalloc(sizeof(char*) * pDrvDescPrivate->nClkMax, GFP_KERNEL);
+    pDrvDescPrivate->apClks = kzalloc(sizeof(struct clk*) * pDrvDescPrivate->nClkMax, GFP_KERNEL);
+    pDrvDescPrivate->abClkPutRequired = kzalloc(sizeof(bool) * pDrvDescPrivate->nClkMax, GFP_KERNEL);
+    pDrvDescPrivate->pszPhyClkNames = kzalloc(ATEMSYS_MAX_PHY_CLKS * ATEMSYS_CLOCK_NAME_MAX_LEN, GFP_KERNEL);
+    if (   (NULL == pDrvDescPrivate->apClkNames)
+        || (NULL == pDrvDescPrivate->apClks)
+        || (NULL == pDrvDescPrivate->abClkPutRequired)
+        || (NULL == pDrvDescPrivate->pszPhyClkNames))
+    {
+        pDrvDescPrivate->nClkCnt = 0;
+        pDrvDescPrivate->nClkMax = 0;
     }
     else
     {
-        pDrvDescPrivate->nClkCnt = 0;
+        for (dwIndex = 0; dwIndex < (unsigned int)pDrvDescPrivate->nClkCnt; dwIndex++)
+        {
+            if (!of_property_read_string_index(pDevNode, "clock-names", dwIndex, &pDrvDescPrivate->apClkNames[dwIndex]))
+            {
+                pDrvDescPrivate->apClks[dwIndex] = devm_clk_get(pDev, pDrvDescPrivate->apClkNames[dwIndex]);
+                if (!IS_ERR(pDrvDescPrivate->apClks[dwIndex]))
+                {
+                    clk_prepare_enable(pDrvDescPrivate->apClks[dwIndex]);
+                    DBG("%s: Clock %s enabled\n", szName, pDrvDescPrivate->apClkNames[dwIndex]);
+                }
+                else
+                {
+                    pDrvDescPrivate->apClks[dwIndex] = NULL;
+                }
+            }
+        }
     }
     DBG("%s: found %d Clocks\n", szName, pDrvDescPrivate->nClkCnt);
 
@@ -4519,6 +4744,9 @@ static void AtemsysDtNodeAcquire(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate,
             INF("%s: PHY C45 compatible\n", szName);
             pDrvDescPrivate->MacInfo.bPhyC45Required = true;
         }
+
+        /* enable the clocks of the PHY node like the clocks of the MAC node */
+        AtemsysEnableNodeClocks(pDrvDescPrivate, pDrvDescPrivate->pPhyNode, szName);
     }
     else
     {
@@ -4706,11 +4934,20 @@ static void AtemsysDtNodeRelease(ATEMSYS_T_DRV_DESC_PRIVATE* pDrvDescPrivate)
         if (NULL != pDrvDescPrivate->apClks[dwIndex])
         {
             clk_disable_unprepare(pDrvDescPrivate->apClks[dwIndex]);
+            if (pDrvDescPrivate->abClkPutRequired[dwIndex])
+            {
+                clk_put(pDrvDescPrivate->apClks[dwIndex]);
+            }
+            pDrvDescPrivate->apClks[dwIndex] = NULL;
             DBG("Clock %s unprepared\n", pDrvDescPrivate->apClkNames[dwIndex]);
         }
     }
+    pDrvDescPrivate->nClkCnt = 0;
+    pDrvDescPrivate->nClkMax = 0;
     kfree(pDrvDescPrivate->apClks);
     kfree(pDrvDescPrivate->apClkNames);
+    kfree(pDrvDescPrivate->abClkPutRequired);
+    kfree(pDrvDescPrivate->pszPhyClkNames);
 }
 
 static int EthernetDriverProbe(struct platform_device* pPDev)

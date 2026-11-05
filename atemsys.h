@@ -169,6 +169,13 @@
  *            Add debug log of the DMA user space mapping memory-type (vm_page_prot) on arm/aarch64/riscv
  *            Fix CPSWG for Kernel >= 6.14.9 (skip_fdq argument dropped from k3_udma_glue_reset_rx_chn)
  *            Fix typo in define ATEMSYS_DONT_SET_NONCACHED_DMA_PAGEPROTECTIONLFAG -> ...FLAG
+ *  V1.4.41 - Fix build for Kernel < 3.18.00 (is_device_dma_coherent, dma_pfn_offset)
+ *            Fix DMA release WARNING in dev_munmap() for Kernel >= 6.12.00
+ *            Fix unused-function warning for DeviceIsIommuMapped() and DeviceIsDmaCoherent()
+ *          - Add ATEMSYS_IOCTL_CLOCK_CMD to list the clocks of the device tree node
+ *             and to get and set the rate of a clock by name or by index
+ *          - Fix PHY not responding on MDIO (e.g. DW3504 on RK3568): enable the clocks of the
+ *             PHY device tree node, otherwise clk_disable_unused() switches them off
  *  atemsys is shared across EC-Master V2.7+
 
  *----------------------------------------------------------------------------*/
@@ -183,10 +190,10 @@
 #define EC_ATEMSYSVERSION(a,b,c) (((a)<<2*8)+((b)<<1*8)+((c)<<0*8))
 #endif
 
-#define ATEMSYS_VERSION_STR "1.4.40"
-#define ATEMSYS_VERSION_NUM  1,4,40
+#define ATEMSYS_VERSION_STR "1.4.41"
+#define ATEMSYS_VERSION_NUM  1,4,41
 #if (defined ATEMSYS_C)
-#define USE_ATEMSYS_API_VERSION EC_ATEMSYSVERSION(1,4,40)
+#define USE_ATEMSYS_API_VERSION EC_ATEMSYSVERSION(1,4,41)
 #endif
 
 /* support selection */
@@ -237,6 +244,7 @@
 #define ATEMSYS_IOCTL_INT_SET_CPU_AFFINITY      _IOWR(MAJOR_NUM, 15, __u32)
 #define ATEMSYS_IOCTL_IOMEM_CMD                 _IOWR(MAJOR_NUM, 16, ATEMSYS_T_IOMEM_CMD)
 #define ATEMSYS_IOCTL_CPSWG_CMD                 _IOWR(MAJOR_NUM, 17, ATEMSYS_T_CPSWG_CMD)
+#define ATEMSYS_IOCTL_CLOCK_CMD                 _IOWR(MAJOR_NUM, 18, ATEMSYS_T_CLOCK_CMD)
 
 /* support legacy source code */
 #define IOCTL_PCI_FIND_DEVICE           ATEMSYS_IOCTL_PCI_FIND_DEVICE
@@ -436,6 +444,24 @@ typedef struct
 } __attribute__((packed)) ATEMSYS_T_PHY_START_STOP_INFO;
 
 
+#define ATEMSYS_CLOCK_NAME_MAX_LEN         0x20
+typedef struct
+{
+    __u32                       dwIndex;                            /* [out]    Index of Mac in atemsys handling */
+    __u32                       dwCmd;                              /* [out]    Id of the command */
+#define ATEMSYS_CLOCK_CMD_GET_RATE        1
+#define ATEMSYS_CLOCK_CMD_SET_RATE        2
+
+    __u32                       dwClkIndex;                         /* [in/out] Index of the clock in atemsys handling. Selects the clock if szClkName
+                                                                              is empty, otherwise the index of the clock found by name is returned */
+    __u32                       dwClkCnt;                           /* [in]     Number of clocks of this mac. Walk dwClkIndex 0 .. dwClkCnt-1 with an
+                                                                              empty szClkName to list them */
+    char                        szClkName[ATEMSYS_CLOCK_NAME_MAX_LEN]; /* [in/out] Entry of "clock-names" of the device tree node, e.g. "clk_mac_speed".
+                                                                              Empty: the clock is addressed by dwClkIndex and its name is returned */
+    __u64                       qwRate;                             /* [in/out] Rate in Hz. Read it before changing it, to be able to restore it */
+    __u32                       dwErrorCode;                        /* [in]     Error code defined in SDK/INC/EcError.h */
+    __u32                       dwReserved[1];
+} __attribute__((packed)) ATEMSYS_T_CLOCK_CMD;
 
 
 typedef struct
